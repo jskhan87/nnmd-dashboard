@@ -1,33 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-GitHub Actions용: OneDrive의 엑셀이 바뀌었는지 확인하고, 바뀌었으면 내려받는다.
+GitHub Actions용: OneDrive 공유 링크로 엑셀을 내려받아, 대시보드 내용이 바뀌었는지 확인한다.
 
-환경변수 (GitHub Secrets/Variables)
-  MS_CLIENT_ID      Entra 앱 등록의 Application (client) ID
-  MS_REFRESH_TOKEN  get_token.py로 받은 refresh token
-  XLSX_ONEDRIVE_PATH  OneDrive 루트 기준 엑셀 경로 (예: "_NNMD 운영 (통합).xlsx")
-  GH_PAT, GITHUB_REPOSITORY  (선택) refresh token 자동 교체용
+환경변수 (GitHub Secret)
+  XLSX_SHARE_URL   엑셀의 "링크가 있는 모든 사용자 - 보기" 공유 링크 (https://1drv.ms/x/c/...)
 
 출력 ($GITHUB_OUTPUT)
-  changed=true|false
+  changed=true|false        대시보드에 표시될 내용이 바뀌었는지
+  state_changed=true        상태(.state) 캐시 저장 필요 여부
   xlsx=<내려받은 파일 경로>
 
-로그에는 파일 내용·이름을 남기지 않는다 (공개 저장소 대비).
+로그에는 링크·파일 내용을 남기지 않는다 (공개 저장소 대비).
 """
-import datetime as dt
+import hashlib
 import os
-import subprocess
 import sys
-import urllib.parse
 
 import requests
 
-TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
-SCOPE = "Files.Read Tasks.Read offline_access"
-GRAPH = "https://graph.microsoft.com/v1.0"
-STATE_DIR = ".state"
-ETAG_FILE = os.path.join(STATE_DIR, "etag")
-ROTATED_FILE = os.path.join(STATE_DIR, "rotated")
+import nnmd_dashboard as nd
+
+STATE_FILE = os.path.join(".state", "digest")
+# OneDrive는 브라우저가 아닌 요청(기본 User-Agent)을 차단하므로 브라우저처럼 요청
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
 
 def out(key, val):
@@ -37,88 +33,46 @@ def out(key, val):
             f.write(f"{key}={val}\n")
 
 
-def read(path):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return ""
-
-
-def write(path, text):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
-def get_access_token():
-    r = requests.post(TOKEN_URL, data={
-        "client_id": os.environ["MS_CLIENT_ID"],
-        "grant_type": "refresh_token",
-        "refresh_token": os.environ["MS_REFRESH_TOKEN"],
-        "scope": SCOPE,
-    }, timeout=30)
-    if r.status_code != 200:
-        err = r.json().get("error", r.status_code)
-        sys.exit(f"[토큰 갱신 실패] {err} — get_token.py로 refresh token을 다시 받아 MS_REFRESH_TOKEN을 갱신하세요.")
-    j = r.json()
-    new_rt = j.get("refresh_token")
-    if new_rt:
-        print(f"::add-mask::{new_rt}")
-    print(f"::add-mask::{j['access_token']}")
-    return j["access_token"], new_rt
-
-
-def rotate_refresh_token(new_rt):
-    """refresh token은 쓸 때마다 새것이 발급되고 각자 만료(약 90일)가 있으므로 하루 한 번 Secret을 교체."""
-    today = dt.date.today().isoformat()
-    if not new_rt or read(ROTATED_FILE) == today:
-        return
-    pat, repo = os.environ.get("GH_PAT"), os.environ.get("GITHUB_REPOSITORY")
-    if not pat or not repo:
-        print("::warning::GH_PAT 없음 — refresh token 자동 교체 생략 (약 90일 후 수동 갱신 필요)")
-        return
-    r = subprocess.run(["gh", "secret", "set", "MS_REFRESH_TOKEN", "--repo", repo],
-                       input=new_rt, text=True, env={**os.environ, "GH_TOKEN": pat},
-                       capture_output=True)
-    if r.returncode == 0:
-        write(ROTATED_FILE, today)
-        out("state_changed", "true")
-        print("refresh token 교체 완료")
-    else:
-        print("::warning::refresh token 교체 실패 (다음 실행에서 재시도)")
+def download(url, dst):
+    url = url.strip()
+    print(f"::add-mask::{url}")
+    url += ("&" if "?" in url else "?") + "download=1"
+    s = requests.Session()
+    s.headers["User-Agent"] = UA
+    r = s.get(url, allow_redirects=True, timeout=120)
+    if r.status_code != 200 or not r.content.startswith(b"PK"):
+        sys.exit(f"[엑셀 다운로드 실패] HTTP {r.status_code}, 형식 {r.headers.get('content-type', '?')} "
+                 "— 공유 링크가 '링크가 있는 모든 사용자'로 되어 있는지, 만료·삭제되지 않았는지 확인")
+    with open(dst, "wb") as f:
+        f.write(r.content)
 
 
 def main():
     force = "--force" in sys.argv
-    token, new_rt = get_access_token()
-    h = {"Authorization": f"Bearer {token}"}
-    path = urllib.parse.quote(os.environ["XLSX_ONEDRIVE_PATH"].strip("/"))
+    dst = os.path.abspath("work.xlsx")
+    download(os.environ["XLSX_SHARE_URL"], dst)
 
-    meta = requests.get(f"{GRAPH}/me/drive/root:/{path}", headers=h,
-                        params={"$select": "id,eTag,cTag,lastModifiedDateTime"}, timeout=30)
-    if meta.status_code != 200:
-        sys.exit(f"[엑셀 조회 실패] HTTP {meta.status_code} — XLSX_ONEDRIVE_PATH 확인")
-    m = meta.json()
-    tag = m.get("cTag") or m.get("eTag")   # cTag: 내용이 바뀔 때만 변경
+    # 파일 자체가 아니라 '대시보드에 보일 내용'으로 비교 → 엑셀 서식만 바뀐 경우 등은 건너뜀
+    nd.XLSX_PATH = dst
+    body, _, _ = nd.build_body(nd.load_projects())
+    digest = hashlib.sha1(body.encode("utf-8")).hexdigest()
 
-    rotate_refresh_token(new_rt)
+    try:
+        prev = open(STATE_FILE, encoding="utf-8").read().strip()
+    except FileNotFoundError:
+        prev = ""
 
-    if not force and tag == read(ETAG_FILE):
-        print("엑셀 변경 없음")
+    if not force and digest == prev:
+        print("대시보드 내용 변경 없음")
         out("changed", "false")
         return
 
-    data = requests.get(f"{GRAPH}/me/drive/items/{m['id']}/content", headers=h, timeout=120)
-    if data.status_code != 200:
-        sys.exit(f"[엑셀 다운로드 실패] HTTP {data.status_code}")
-    dst = os.path.abspath("work.xlsx")
-    with open(dst, "wb") as f:
-        f.write(data.content)
-    write(ETAG_FILE, tag)     # 이후 단계가 실패하면 캐시가 저장되지 않으므로 다음 실행에서 재시도됨
-    out("state_changed", "true")
-    print("엑셀 변경 감지 → 내려받음")
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        f.write(digest)   # 이후 단계가 실패하면 캐시가 저장되지 않으므로 다음 실행에서 재시도됨
+    print("대시보드 내용 변경 감지")
     out("changed", "true")
+    out("state_changed", "true")
     out("xlsx", dst)
 
 
