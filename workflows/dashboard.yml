@@ -1,0 +1,101 @@
+name: NNMD dashboard
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"      # 5분마다 (GitHub 최소 간격; 실제로는 수 분~20분 지연될 수 있음)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "엑셀 변경 여부와 관계없이 강제 갱신"
+        type: boolean
+        default: false
+
+concurrency:
+  group: nnmd-dashboard          # 실행이 겹쳐 Obsidian Sync가 동시에 돌지 않도록
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  XLSX_ONEDRIVE_PATH: "_NNMD 운영 (통합).xlsx"
+  DASHBOARD_PATH: "00_Inbox/__DASHBOARD__.md"
+  # 대시보드 폴더만 받도록 나머지 최상위 폴더는 동기화 제외 (vault에 폴더를 새로 만들면 여기에 추가)
+  OB_EXCLUDE: "10_Fragments,20_Operations,30_Builds,90_Media,Excalidraw,Untitled"
+  OB_HEADLESS_VERSION: "0.0.14"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -q openpyxl requests
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Check Excel on OneDrive
+        id: fetch
+        env:
+          MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+          MS_REFRESH_TOKEN: ${{ secrets.MS_REFRESH_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: python cloud_fetch.py ${{ inputs.force && '--force' || '' }}
+
+      - name: Setup Node
+        if: steps.fetch.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Pull vault (dashboard folder only)
+        if: steps.fetch.outputs.changed == 'true'
+        env:
+          OBSIDIAN_AUTH_TOKEN: ${{ secrets.OBSIDIAN_AUTH_TOKEN }}
+          OB_VAULT: ${{ secrets.OB_VAULT }}
+          OB_VAULT_PASSWORD: ${{ secrets.OB_VAULT_PASSWORD }}
+        run: |
+          set -e
+          npm install -g "obsidian-headless@${OB_HEADLESS_VERSION}" >/dev/null 2>&1
+          mkdir -p vault
+          PW=(); [ -n "$OB_VAULT_PASSWORD" ] && PW=(--password "$OB_VAULT_PASSWORD")
+          # 로그에 vault 파일명이 찍히지 않도록 출력은 버리고 종료 코드만 확인
+          ob sync-setup --vault "$OB_VAULT" --path vault --device-name "github-actions" "${PW[@]}" --json >/dev/null 2>&1 \
+            || { echo "::error::ob sync-setup 실패 (OB_VAULT·토큰·암호 확인)"; exit 1; }
+          ob sync-config --path vault --excluded-folders "$OB_EXCLUDE" --file-types "" --configs "" >/dev/null 2>&1 \
+            || { echo "::error::ob sync-config 실패"; exit 1; }
+          ob sync --path vault >/dev/null 2>&1 || { echo "::error::ob sync(내려받기) 실패"; exit 1; }
+          echo "vault 내려받기 완료"
+
+      - name: Build dashboard
+        if: steps.fetch.outputs.changed == 'true'
+        run: python nnmd_dashboard.py --xlsx "${{ steps.fetch.outputs.xlsx }}" --out "vault/${DASHBOARD_PATH}"
+
+      - name: Push to Obsidian Sync
+        if: steps.fetch.outputs.changed == 'true'
+        env:
+          OBSIDIAN_AUTH_TOKEN: ${{ secrets.OBSIDIAN_AUTH_TOKEN }}
+        run: |
+          ob sync --path vault >/dev/null 2>&1 || { echo "::error::ob sync(올리기) 실패"; exit 1; }
+          echo "Obsidian Sync 업로드 완료"
+
+      - name: Clean up
+        if: always()
+        run: rm -rf vault work.xlsx
+
+      - name: Save state
+        if: success() && steps.fetch.outputs.state_changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}
