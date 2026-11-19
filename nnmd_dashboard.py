@@ -14,6 +14,7 @@ NNMD 프로젝트 대시보드 생성기
 import datetime as dt
 import hashlib
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -83,6 +84,21 @@ def cell_text(v):
     return " ".join(str(v).split())
 
 
+def join_lines(v):
+    """셀 안 줄바꿈 항목을 ' / '로 연결. 줄 앞의 글머리표(-, •, *, ·, 숫자.)는 제거"""
+    if v is None:
+        return ""
+    if isinstance(v, (dt.datetime, dt.date)):
+        return cell_text(v)
+    items = []
+    for line in str(v).splitlines():
+        line = re.sub(r"^\s*(?:[-•*·▪◦]|\d+[.)])\s*", "", line)
+        line = " ".join(line.split())
+        if line:
+            items.append(line)
+    return " / ".join(items)
+
+
 def http_link(cell):
     if cell.hyperlink is not None and cell.hyperlink.target and cell.hyperlink.target.startswith("http"):
         return cell.hyperlink.target
@@ -107,6 +123,8 @@ def load_projects():
             continue
         p = {k: cell_text(get(k).value) if get(k) else "" for k in COLS}
         p["name"] = name
+        if get("next"):
+            p["next"] = join_lines(get("next").value)
         p["priority"] = p["priority"].upper()[:1]
         upd = get("updated").value if get("updated") else None
         p["updated_dt"] = upd if isinstance(upd, (dt.datetime, dt.date)) else None
