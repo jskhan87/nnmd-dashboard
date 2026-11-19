@@ -150,11 +150,13 @@ def build_body(projects):
         items = sorted([p for p in active if p["group"] == g], key=sort_key)
         if not items:
             continue
-        out += [f"## {g or '미분류'}", "| 프로젝트 | 다음 액션 |", "|---|---|"]
+        # 표 대신 한 줄 목록: 모바일에서 셀 여백·줄바꿈이 적음 (제목은 목록을 끊어주는 작은 헤딩)
+        out.append(f"#### {g or '미분류'}")
         for p in items:
-            name = f"[{esc(p['name'])}]({p['url']})" if p["url"] else esc(p["name"])
+            name = f"[{p['name']}]({p['url']})" if p["url"] else p["name"]
             emo = status_emoji(p["status"])
-            out.append(f"| {emo + ' ' if emo else ''}{name} | {esc(p['next'])} |")
+            nxt = f" — {p['next']}" if p["next"] else ""
+            out.append(f"- {emo + ' ' if emo else ''}**{name}**{nxt}")
     return "\n".join(out), len(active), len(done)
 
 
@@ -166,12 +168,13 @@ def generate(force=False):
     # 내용이 같으면 파일을 다시 쓰지 않음 (동기화 충돌·불필요한 churn 방지)
     if not force and os.path.exists(OUT_PATH):
         with open(OUT_PATH, encoding="utf-8") as f:
-            if f"hash: {digest}" in f.read(400):
+            if f"%%hash: {digest}%%" in f.read():
                 return False
 
     now = dt.datetime.now(KST)
-    head = (f"---\nupdated: {now:%Y-%m-%d %H:%M}\nhash: {digest}\n---\n"
-            f"갱신 {now:%m/%d} ({WD[now.weekday()]}) {now:%H:%M}\n")
+    # 속성(frontmatter) 상자를 없애 상단 여백 제거; 비교용 hash는 화면에 안 보이는 %% 주석으로 맨 끝에
+    head = f"갱신 {now:%m/%d} ({WD[now.weekday()]}) {now:%H:%M}\n"
+    body = body + f"\n%%hash: {digest}%%\n"
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     tmp = OUT_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
