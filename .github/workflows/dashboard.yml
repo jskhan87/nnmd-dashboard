@@ -63,26 +63,30 @@ jobs:
           OB_VAULT_PASSWORD: ${{ secrets.OB_VAULT_PASSWORD }}
         run: |
           set -e
+          # 복사·붙여넣기로 섞인 줄바꿈·공백 제거
+          export OBSIDIAN_AUTH_TOKEN="$(printf %s "$OBSIDIAN_AUTH_TOKEN" | tr -d '[:space:]')"
+          export OB_VAULT="$(printf %s "$OB_VAULT" | tr -d '[:space:]')"
           npm install -g "obsidian-headless@${OB_HEADLESS_VERSION}" >/dev/null 2>&1
           mkdir -p vault
           PW=(); [ -n "$OB_VAULT_PASSWORD" ] && PW=(--password "$OB_VAULT_PASSWORD")
-          # 로그에 vault 파일명이 찍히지 않도록 출력은 버리고 종료 코드만 확인
-          ob sync-setup --vault "$OB_VAULT" --path vault --device-name "github-actions" "${PW[@]}" --json >/dev/null 2>&1 \
-            || { echo "::error::ob sync-setup 실패 (OB_VAULT·토큰·암호 확인)"; exit 1; }
-          ob sync-config --path vault --excluded-folders "$OB_EXCLUDE" --file-types "" --configs "" >/dev/null 2>&1 \
-            || { echo "::error::ob sync-config 실패"; exit 1; }
+          # setup/config는 오류 메시지만 표시(파일명 없음), sync는 파일명이 찍히므로 출력 전부 숨김
+          ob sync-setup --vault "$OB_VAULT" --path vault --device-name "github-actions" "${PW[@]}" --json >/dev/null \
+            || { echo "::error::ob sync-setup 실패 (위 메시지 참고)"; exit 1; }
+          ob sync-config --path vault --excluded-folders "$OB_EXCLUDE" --file-types "" --configs "" >/dev/null \
+            || { echo "::error::ob sync-config 실패 (위 메시지 참고)"; exit 1; }
           ob sync --path vault >/dev/null 2>&1 || { echo "::error::ob sync(내려받기) 실패"; exit 1; }
           echo "vault 내려받기 완료"
 
       - name: Build dashboard
         if: steps.fetch.outputs.changed == 'true'
-        run: python nnmd_dashboard.py --xlsx "${{ steps.fetch.outputs.xlsx }}" --out "vault/${DASHBOARD_PATH}"
+        run: python nnmd_dashboard.py --xlsx "${{ steps.fetch.outputs.xlsx }}" --out "vault/${DASHBOARD_PATH}" ${{ inputs.force && '--force' || '' }}
 
       - name: Push to Obsidian Sync
         if: steps.fetch.outputs.changed == 'true'
         env:
           OBSIDIAN_AUTH_TOKEN: ${{ secrets.OBSIDIAN_AUTH_TOKEN }}
         run: |
+          export OBSIDIAN_AUTH_TOKEN="$(printf %s "$OBSIDIAN_AUTH_TOKEN" | tr -d '[:space:]')"
           ob sync --path vault >/dev/null 2>&1 || { echo "::error::ob sync(올리기) 실패"; exit 1; }
           echo "Obsidian Sync 업로드 완료"
 
